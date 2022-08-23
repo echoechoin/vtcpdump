@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 import os
+import re
 import sys
 import signal
 TAP_NAME_IN_KERNEL_SPACE = "vtcpdump_tap"
@@ -12,7 +13,7 @@ def vpp_interface_list()->list:
     return vpp_if_list
 
 def vpp_create_tap_device()->str:
-    tap_if_name = os.popen("vppctl create tap host-if-name %s".TAP_NAME_IN_KERNEL_SPACE).read().strip()
+    tap_if_name = os.popen("vppctl create tap host-if-name %s"%TAP_NAME_IN_KERNEL_SPACE).read().strip()
     os.system("vppctl set int state %s up" % tap_if_name)
     return tap_if_name
 
@@ -27,7 +28,10 @@ def vpp_set_promiscuous_mode(if_name: str, mode:str)->None:
 
 def vpp_get_tap_list()->list:
     tap_list_map = []
-    tap_list = os.popen("vppctl show tap | grep '^Interface:' -A 1").read().split("--")
+    tap_list = os.popen("vppctl show tap | grep '^Interface:' -A 1").read()
+    if tap_list == "":
+        return tap_list_map
+    tap_list.split("--")
     for i in range(len(tap_list)):
         tap_list[i] = tap_list[i].split()
         tap_list_map.append([tap_list[i][1],tap_list[i][5][1:-1]])
@@ -78,9 +82,10 @@ def tcpdump_get_cmd(tap_if_name:str)->str:
     return tcpdump_cmd
 
 def tcpdump_get_interface_from_cmd(args:list)-> str:
+    regex = re.compile("^-[a-zA-Z]*i$")
     interface = ""
     for i in range(len(args)):
-        if args[i] == "-i":
+        if regex.fullmatch(args[i]):
             interface = args[i+1]
             break
     return interface
