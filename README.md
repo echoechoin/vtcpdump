@@ -12,6 +12,6 @@ using tap device to receive packets from vpp interface. then using tcpdump to ca
 
 ## supported vpp version
 
-I've just tested this on vpp version 20.05, may be it works on other versions.
+I've just tested this on vpp version 22.02, may be it works on other versions.
 
 have fun ! ! 😆😆
