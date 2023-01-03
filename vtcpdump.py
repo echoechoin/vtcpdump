@@ -10,8 +10,8 @@ import subprocess
 
 class Vtcpdump(object):
     """
-    使用tcpdump抓取vpp网口/网桥的流量: 通过将网口的流量转发到虚拟网口对，然后使用tcpdump抓取虚拟网口对的流量。
-    FIXME: 暂时无法通过host参数过滤url (tcpdump.py -ni <interface> host <url>)
+    Using tcpdump to capture packets on vpp interfaces(only dpdk interfaces and bridge-domain interfaces).
+    FIXME: can not filter packets by url (tcpdump.py -ni <interface> host <url>) because of the problem about DNS.
     """
     DPDK_PORT_FORMAT = "^[A-Za-z0-9]*Ethernet[A-Za-z0-9]+\/[A-Za-z0-9]+\/[A-Za-z0-9]+$"
     PCAP_KERNEL_PORT_FORMAT = "rayp0_%s"
@@ -25,51 +25,50 @@ class Vtcpdump(object):
         self.if_list = []
         self.span_if_list = []
         self.if_name = None
-        self.lock_file = self.LOCK_FILE_FORMAT % self.pid
-        self.lock_file_fd = None
+        self.lock_file_name = self.LOCK_FILE_FORMAT % self.pid
+        self.lock_file = None
         self.flock_check()
         self.vpp_process_check()
         self.get_vpp_if_list()
-        # 获取需要抓包的vpp网口或者网桥
         self.get_tcpdump_if_name(sys.argv[1:])
-        # 获取需要抓包的网口列表 (网桥中有多个网口)
+        # get interfaces that need to map to the veth device (bridge may have more than one interface that need to map)
         self.get_span_if_list()
         self.sighander_register()
-        # 将需要抓包的网口的流量转发到虚拟网口对
+        # let the network packets forward to the veth device
         self.create_host_pair()
         self.vpp_associate_to_host_pair()
         self.vpp_host_pair_up()
         self.vpp_span_to_host_pair(self.span_if_list)
         self.tcpdump_start_capture()
-        if self.lock_file_fd != None:
-            os.close(self.lock_file_fd)
+        if self.lock_file != None:
+            self.lock_file.close()
         self.clear_ctx(self.pid)
         sys.exit(0)
 
-    def get_pid_from_lock_file(self, lock_file):
-        pid = lock_file.split("_")[-1].split(".")[0]
+    def get_pid_from_lock_file(self, lock_file_name):
+        pid = lock_file_name.split("_")[-1].split(".")[0]
         if re.match("^[0-9]+$", pid):
             return int(pid)
         return 0
 
     def flock_check(self):
-        for lock_file in pathlib.Path("/tmp").glob("vtcpdump_*.lock"):
-            lock_file = str(lock_file)
+        for lock_file_name in pathlib.Path("/tmp").glob("vtcpdump_*.lock"):
+            lock_file_name = str(lock_file_name)
             try:
-                pid = self.get_pid_from_lock_file(lock_file)
-                fd = open(lock_file, "w")
+                pid = self.get_pid_from_lock_file(lock_file_name)
+                fd = open(lock_file_name, "w")
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 self.clear_ctx(pid)
                 fd.close()
-                os.unlink(lock_file)
+                os.unlink(lock_file_name)
             except:
                 continue
-        self.lock_file_fd = open(self.lock_file, "w")
+        self.lock_file = open(self.lock_file_name, "w")
         try:
-            fcntl.flock(self.lock_file_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(self.lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except:
             print("confict with other vtcpdump process! %s is locked!(current pid: %s)" % (
-                self.lock_file, self.pid))
+                self.lock_file_name, self.pid))
             sys.exit(1)
 
     def vpp_process_check(self):
