@@ -4,7 +4,7 @@ using tcpdump to capture packets from vpp interface.
 
 ## principles
 
-using tap device to receive packets from vpp interface. then using tcpdump to capture packets.
+using veth device to receive packets from vpp interface. then using tcpdump to capture packets.
 
 ## usages
 
