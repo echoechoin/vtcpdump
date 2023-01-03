@@ -2,59 +2,74 @@
 import re
 import os
 import sys
-import signal
 import fcntl
+import signal
+import pathlib
 import subprocess
+
 
 class Vtcpdump(object):
     """
     使用tcpdump抓取vpp网口/网桥的流量: 通过将网口的流量转发到虚拟网口对，然后使用tcpdump抓取虚拟网口对的流量。
     FIXME: 暂时无法通过host参数过滤url (tcpdump.py -ni <interface> host <url>)
     """
-    DPDK_PORT_FORMAT   = "^[A-Za-z0-9]*Ethernet[A-Za-z0-9]+\/[A-Za-z0-9]+\/[A-Za-z0-9]+$"
-    PCAP_KERNEL_PORT   = "ray_pcap_out"
-    PCAP_VPP_PORT      = "ray_pcap_in"
-    LOCK_FILE = "/tmp/vtcpdump.lock"
+    DPDK_PORT_FORMAT = "^[A-Za-z0-9]*Ethernet[A-Za-z0-9]+\/[A-Za-z0-9]+\/[A-Za-z0-9]+$"
+    PCAP_KERNEL_PORT_FORMAT = "rayp0_%s"
+    PCAP_VPP_PORT_FORMAT = "rayp1_%s"
+    LOCK_FILE_FORMAT = "/tmp/vtcpdump_%s.lock"
+
     def __init__(self):
-        self.lock_file_fd          = None # 文件锁
-        self.if_list               = []   # vpp可以抓包的网口列表
-        self.span_if_list          = []   # 如果是网桥，则需要获取抓包的网口列表
-        self.if_name               = None # 需要抓包的网口或者网桥
-        # 文件锁，用于保证只有一个vtcpdump进程在运行
+        self.pid = os.getpid()
+        self.pcap_kernel_port = self.PCAP_KERNEL_PORT_FORMAT % str(self.pid)
+        self.pcap_vpp_port = self.PCAP_VPP_PORT_FORMAT % str(self.pid)
+        self.if_list = []
+        self.span_if_list = []
+        self.if_name = None
+        self.lock_file = self.LOCK_FILE_FORMAT % self.pid
+        self.lock_file_fd = None
         self.flock_check()
-        # 检查vpp进程是否存在
         self.vpp_process_check()
-        # 获取vpp网口列表
         self.get_vpp_if_list()
         # 获取需要抓包的vpp网口或者网桥
         self.get_tcpdump_if_name(sys.argv[1:])
         # 获取需要抓包的网口列表 (网桥中有多个网口)
         self.get_span_if_list()
-        # 注册信号处理函数
         self.sighander_register()
-        # 清除之前的环境
-        self.clear_ctx()
-        # 创建虚拟网口对
-        self.create_host_pair()
-        # 关联虚拟网口到vpp
-        self.vpp_associate_to_host_pair()
-        # 使能虚拟网口对
-        self.vpp_host_pair_up()
         # 将需要抓包的网口的流量转发到虚拟网口对
+        self.create_host_pair()
+        self.vpp_associate_to_host_pair()
+        self.vpp_host_pair_up()
         self.vpp_span_to_host_pair(self.span_if_list)
-        # 启动vpp抓包进程
         self.tcpdump_start_capture()
-        # 结束抓包进程后，清除环境
-        self.clear_ctx()
-        # 退出
+        if self.lock_file_fd != None:
+            os.close(self.lock_file_fd)
+        self.clear_ctx(self.pid)
         sys.exit(0)
-        
+
+    def get_pid_from_lock_file(self, lock_file):
+        pid = lock_file.split("_")[-1].split(".")[0]
+        if re.match("^[0-9]+$", pid):
+            return int(pid)
+        return 0
+
     def flock_check(self):
-        self.lock_file_fd = os.open(self.LOCK_FILE, os.O_CREAT | os.O_RDWR)
+        for lock_file in pathlib.Path("/tmp").glob("vtcpdump_*.lock"):
+            lock_file = str(lock_file)
+            try:
+                pid = self.get_pid_from_lock_file(lock_file)
+                fd = open(lock_file, "w")
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.clear_ctx(pid)
+                fd.close()
+                os.unlink(lock_file)
+            except:
+                continue
+        self.lock_file_fd = open(self.lock_file, "w")
         try:
             fcntl.flock(self.lock_file_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except:
-            print("another vtcpdump is running...")
+            print("confict with other vtcpdump process! %s is locked!(current pid: %s)" % (
+                self.lock_file, self.pid))
             sys.exit(1)
 
     def vpp_process_check(self):
@@ -64,7 +79,8 @@ class Vtcpdump(object):
         return True
 
     def get_vpp_if_list(self):
-        if_list_tmp = subprocess.Popen("vppctl show int | grep '^\w' | awk '{print $1}'", shell=True, stdout=subprocess.PIPE).stdout.readlines()
+        if_list_tmp = subprocess.Popen(
+            "vppctl show int | grep '^\w' | awk '{print $1}'", shell=True, stdout=subprocess.PIPE).stdout.readlines()
         for i in range(len(if_list_tmp)):
             if_name = if_list_tmp[i].strip().decode()
             if self.vpp_if_is_dpdk(if_name) or self.vpp_if_is_bvi(if_name):
@@ -77,14 +93,15 @@ class Vtcpdump(object):
             return False
 
     def vpp_if_is_bvi(self, if_name):
-        bvi_list = subprocess.Popen("vppctl show bridge-domain | awk '{print $13}' | grep -v BVI-Intf", shell=True, stdout=subprocess.PIPE).stdout.readlines()
+        bvi_list = subprocess.Popen(
+            "vppctl show bridge-domain | awk '{print $13}' | grep -v BVI-Intf", shell=True, stdout=subprocess.PIPE).stdout.readlines()
         for i in range(len(bvi_list)):
             bvi_list[i] = bvi_list[i].strip().decode()
         if if_name in bvi_list:
             return True
         else:
             return False
-        
+
     def get_tcpdump_if_name(self, args):
         regex = re.compile("^-[a-zA-Z]*i$")
         for i in range(len(args)):
@@ -108,91 +125,105 @@ class Vtcpdump(object):
             sys.exit(4)
 
     def vpp_if_list_in_bridge(self, bvi_if_name):
-        bridge_domain_id = subprocess.Popen("vppctl show bridge-domain | grep %s | awk '{print $1}'"%bvi_if_name, shell=True, stdout=subprocess.PIPE).stdout.readlines()
+        bridge_domain_id = subprocess.Popen(
+            "vppctl show bridge-domain | grep %s | awk '{print $1}'" % bvi_if_name, shell=True, stdout=subprocess.PIPE).stdout.readlines()
         if bridge_domain_id == []:
             return []
         bridge_domain_id = bridge_domain_id[0].strip().decode()
-        cmd = "vppctl show bridge-domain %s detail | grep Interface -A 255 | awk '{print $1}' | egrep '%s'"%(bridge_domain_id, self.DPDK_PORT_FORMAT)
-        if_list = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE).stdout.readlines()
+        cmd = "vppctl show bridge-domain %s detail | grep Interface -A 255 | awk '{print $1}' | egrep '%s'" % (
+            bridge_domain_id, self.DPDK_PORT_FORMAT)
+        if_list = subprocess.Popen(
+            cmd, shell=True, stdout=subprocess.PIPE).stdout.readlines()
         for i in range(len(if_list)):
             if_list[i] = if_list[i].strip().decode()
         return if_list
 
     def sighander_register(self):
         def sighander(*args, **kwargs):
-            self.clear_ctx()
+            self.clear_ctx(self.pid)
             sys.exit(0)
         signal.signal(signal.SIGINT, sighander)
         signal.signal(signal.SIGHUP, sighander)
         signal.signal(signal.SIGTERM, sighander)
 
     def create_host_pair(self):
-        cmd = "ip link add name %s type veth peer name %s"%(self.PCAP_KERNEL_PORT, self.PCAP_VPP_PORT)
+        cmd = "ip link add name %s type veth peer name %s" % (
+            self.pcap_kernel_port, self.pcap_vpp_port)
         subprocess.run(cmd, shell=True, stdout=subprocess.PIPE)
-        cmd = "ip link set %s up"%self.PCAP_KERNEL_PORT
+        cmd = "ip link set %s up" % self.pcap_kernel_port
         subprocess.run(cmd, shell=True, stdout=subprocess.PIPE)
-        cmd = "ip link set %s up"%self.PCAP_VPP_PORT
+        cmd = "ip link set %s up" % self.pcap_vpp_port
         subprocess.run(cmd, shell=True, stdout=subprocess.PIPE)
 
-    def delete_host_pair(self):
-        cmd = "ip link set %s down > /dev/null 2>&1"%self.PCAP_KERNEL_PORT
+    def delete_host_pair(self, pid):
+        cmd = "ip link set %s down > /dev/null 2>&1" % (
+            self.PCAP_KERNEL_PORT_FORMAT % pid)
         subprocess.run(cmd, shell=True, stdout=subprocess.PIPE)
-        cmd = "ip link set %s down > /dev/null 2>&1"%self.PCAP_VPP_PORT
+        cmd = "ip link set %s down > /dev/null 2>&1" % (
+            self.PCAP_VPP_PORT_FORMAT % pid)
         subprocess.run(cmd, shell=True, stdout=subprocess.PIPE)
-        cmd = "ip link del %s > /dev/null 2>&1"%self.PCAP_KERNEL_PORT
+        cmd = "ip link del %s > /dev/null 2>&1" % (
+            self.PCAP_KERNEL_PORT_FORMAT % pid)
         subprocess.run(cmd, shell=True, stdout=subprocess.PIPE)
 
     def vpp_associate_to_host_pair(self):
-        cmd = "vppctl create host-interface name %s"%self.PCAP_VPP_PORT
-        retcode = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).returncode
+        cmd = "vppctl create host-interface name %s" % self.pcap_vpp_port
+        retcode = subprocess.run(
+            cmd, shell=True, stdout=subprocess.PIPE).returncode
+        if retcode != 0:
+            return False
+        return True
+
+    def vpp_disassociate_from_host_pair(self, pid):
+        cmd = "vppctl delete host-interface name %s" % (
+            self.PCAP_VPP_PORT_FORMAT % pid)
+        retcode = subprocess.run(
+            cmd, shell=True, stdout=subprocess.PIPE).returncode
         if retcode != 0:
             return False
         return True
 
     def vpp_host_pair_up(self):
-        cmd = "vppctl set int state host-%s up"%self.PCAP_VPP_PORT
-        retcode = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).returncode
+        cmd = "vppctl set int state host-%s up" % self.pcap_vpp_port
+        retcode = subprocess.run(
+            cmd, shell=True, stdout=subprocess.PIPE).returncode
         if retcode != 0:
             return False
         return True
 
-    def vpp_host_pair_down(self):
-        cmd = "vppctl set int state host-%s down"%self.PCAP_VPP_PORT
-        retcode = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).returncode
-        if retcode != 0:
-            return False
-        return True
-
-    def vpp_disassociate_from_host_pair(self):
-        cmd = "vppctl delete host-interface name %s"%self.PCAP_VPP_PORT
-        retcode = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).returncode
+    def vpp_host_pair_down(self, pid):
+        cmd = "vppctl set int state host-%s down" % (
+            self.PCAP_VPP_PORT_FORMAT % pid)
+        retcode = subprocess.run(
+            cmd, shell=True, stdout=subprocess.PIPE).returncode
         if retcode != 0:
             return False
         return True
 
     def vpp_span_to_host_pair(self, if_name_list):
         for if_name in if_name_list:
-            cmd = "vppctl set interface span %s destination host-%s both"%(if_name, self.PCAP_VPP_PORT)
-            retcode = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).returncode
+            cmd = "vppctl set interface span %s destination host-%s both" % (
+                if_name, self.pcap_vpp_port)
+            retcode = subprocess.run(
+                cmd, shell=True, stdout=subprocess.PIPE).returncode
             if retcode != 0:
                 return False
         return True
-    
-    def vpp_unspan_all_interfaces(self):
-        cmd = "vppctl show int span | grep %s | awk '{print $1}'"%self.PCAP_VPP_PORT
-        if_list = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE).stdout.readlines()
+
+    def vpp_unspan_interfaces(self, pid):
+        cmd = "vppctl show int span | grep %s | awk '{print $1}'" % (self.PCAP_VPP_PORT_FORMAT % str(
+            pid))
+        if_list = subprocess.Popen(
+            cmd, shell=True, stdout=subprocess.PIPE).stdout.readlines()
         for i in range(len(if_list)):
             if_list[i] = if_list[i].strip().decode()
         for if_name in if_list:
-            cmd = "vppctl set interface span %s disable"%if_name
-            retcode = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).returncode
-
-    def vpp_delete_host_pair(self):
-        cmd = "ip link del %s"%self.PCAP_KERNEL_PORT
-        ret_code = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).returncode
-        if ret_code != 0:
-            return False
-        return True
+            cmd = "vppctl set interface span %s disable" % if_name
+            retcode = subprocess.run(
+                cmd, shell=True, stdout=subprocess.PIPE).returncode
+            if retcode != 0:
+                print("vppctl set interface span %s disable failed" % if_name)
+                sys.exit(5)
 
     def tcpdump_get_cmd(self):
         tcpdump_cmd = "tcpdump "
@@ -200,7 +231,7 @@ class Vtcpdump(object):
             if i == 0:
                 continue
             if sys.argv[i].startswith("-") and sys.argv[i].endswith("i") and i < len(sys.argv) - 1:
-                sys.argv[i + 1] = self.PCAP_KERNEL_PORT
+                sys.argv[i + 1] = self.pcap_kernel_port
             tcpdump_cmd += sys.argv[i] + " "
         return tcpdump_cmd
 
@@ -208,10 +239,11 @@ class Vtcpdump(object):
         cmd = self.tcpdump_get_cmd()
         subprocess.run(cmd, shell=True)
 
-    def clear_ctx(self):
-        self.vpp_unspan_all_interfaces()
-        self.vpp_host_pair_down()
-        self.vpp_disassociate_from_host_pair()
-        self.delete_host_pair()
-    
+    def clear_ctx(self, pid):
+        self.vpp_unspan_interfaces(pid)
+        self.vpp_host_pair_down(pid)
+        self.vpp_disassociate_from_host_pair(pid)
+        self.delete_host_pair(pid)
+        os.unlink(self.LOCK_FILE_FORMAT % str(pid))
+
 Vtcpdump()
